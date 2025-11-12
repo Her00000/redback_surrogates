@@ -41,6 +41,7 @@ class LearnedSurrogateModel:
         *,
         times=None,
         wavelengths=None,
+        param_names=None,
         metadata=None,
     ):
         """Initialize the surrogate model.
@@ -48,15 +49,12 @@ class LearnedSurrogateModel:
         :param model: The underlying learned model
         :param times: List of time points
         :param wavelengths: List of wavelength points
+        :param param_names: List of parameter names (optional)
         :param metadata: Additional metadata dictionary.
         """
         self._model = model
         if model is None:
             raise ValueError("Model must be provided.")
-
-        # Load the parameter names from the model inputs.
-        self.param_names = [p.name for p in model.graph.input]
-        assert_safe_param_names(self.param_names)
 
         # We store all the metadata in a single dictionary so that we can keep it in one
         # place as we convert back and forth to ONNX files.
@@ -75,6 +73,21 @@ class LearnedSurrogateModel:
                 "Wavelengths must be provided either in metadata or as argument."
             )
 
+        # If given the parameter names, use those. Otherwise try to pull them from
+        # the metadata or model itself.
+        if param_names is not None:
+            self.param_names = list(param_names)
+        elif "param_names" in self._metadata:
+            self.param_names = self._metadata["param_names"]
+        else:
+            self.param_names = [p.name for p in model.graph.input]
+        assert_safe_param_names(self.param_names)
+        self._metadata["param_names"] = self.param_names
+
+        # Determine if we need to collapse the parameters into a single input array
+        # such as used for sklearn models.
+        self._collapse_parameters = len(self.param_names) > 1 and (len(model.graph.input) == 1)
+
         # Create the ONNX runtime session for inference.
         self._ort_session = rt.InferenceSession(
             self._model.SerializeToString(),
@@ -82,11 +95,17 @@ class LearnedSurrogateModel:
         )
 
         # Determine the information about the output. We only support one output value
-        # the grid itself.
+        # the grid itself. Check that we can reshape the output to match the expected grid.
+        num_wave = len(self.wavelengths)
+        num_time = len(self.times)
+        self.output_shape = (num_time, num_wave)
+
         output0 = self._ort_session.get_outputs()[0]
         self.output_name = output0.name
-        if output0.shape[1] != len(self.times) or output0.shape[2] != len(
-            self.wavelengths
+        if (
+            not (len(output0.shape) == 2 and output0.shape[1] == num_wave * num_time) and
+            not (len(output0.shape) == 2 and (output0.shape[0] == num_time and output0.shape[1] == num_wave)) and
+            not (len(output0.shape) == 3 and (output0.shape[1] == num_time and output0.shape[2] == num_wave))
         ):
             raise ValueError(
                 f"Shape of output {output0.shape} does not match the times ({len(self.times)}) "
@@ -195,8 +214,14 @@ class LearnedSurrogateModel:
         :return: The predicted spectral energy distribution grid in f_lambda
             and units of erg/s/Hz.
         """
-        inputs = {
-            key: np.array(params[key]) for key in self.param_names
-        }
-        output = self._ort_session.run([self.output_name], inputs)
+        if self._collapse_parameters:
+            # Collapse all parameters into a single input array
+            input_array = np.column_stack([np.array(params[name]) for name in self.param_names])
+            inputs = {self._ort_session.get_inputs()[0].name: input_array}
+        else:
+            inputs = {key: np.array(params[key]) for key in self.param_names}
+
+        # Unflatten the output if needed.
+        output = self._ort_session.run([self.output_name], inputs)[0]
+        output = output.reshape(self.output_shape)
         return output
