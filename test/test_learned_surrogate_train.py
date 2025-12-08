@@ -5,7 +5,7 @@ from astropy.table import Table
 
 from redback_surrogates.learned_surrogate import LearnedSurrogateModel
 from redback_surrogates.learned_surrogate_data import LearnedSurrogateDataset
-from redback_surrogates.learned_surrogate_train import train_pytorch_model
+from redback_surrogates.learned_surrogate_train import evaluate_learned_model, train_pytorch_model
 
 try:
     import torch
@@ -65,7 +65,10 @@ class TestLearnedSurrogateTrain(unittest.TestCase):
 
         # Test that the surrogate model produces outputs of the correct shape.
         grid = surrogate_model.predict_spectra_grid(x=0.2, y=0.1, z=-0.1)
-        print(grid)
-        print(_toy_function(0.2, 0.1, -0.1))
         assert grid.shape == (2, 3)
         assert np.allclose(grid, _toy_function(0.2, 0.1, -0.1), atol=0.1)
+
+        # Evaluate the model on the training data to get MSE and max SE.
+        mse, maxse = evaluate_learned_model(surrogate_model, dataset)
+        assert mse < 0.02
+        assert maxse < 0.1

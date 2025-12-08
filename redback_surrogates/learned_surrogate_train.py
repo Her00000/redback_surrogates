@@ -159,7 +159,9 @@ def train_pytorch_model(
 
 
 def evaluate_learned_model(model, dataset):
-    """Evaluates a trained LearnedSurrogateModel model on a given LearnedSurrogateDataset.
+    """Evaluates a trained LearnedSurrogateModel model on a given
+    LearnedSurrogateDataset.
+
     Primarily used for computing test set error.
 
     Parameters
@@ -173,8 +175,11 @@ def evaluate_learned_model(model, dataset):
     -------
     float
         The mean squared error of the model on the dataset.
+    float
+        The max squared error of the model on the dataset.
     """
     individual_mse = []
+    individual_maxse = []
     for idx in range(len(dataset)):
         input_params = dataset.get_input_dict(idx)
         true_output = dataset.get_output(idx)
@@ -183,7 +188,10 @@ def evaluate_learned_model(model, dataset):
         predicted_output = model.predict_spectra_grid(**input_params)
 
         # Compute MSE for this sample
-        mse = np.mean((predicted_output - true_output) ** 2)
+        sq_error = (predicted_output - true_output) ** 2
+        mse = np.mean(sq_error)
+        maxse = np.max(sq_error)
         individual_mse.append(mse)
+        individual_maxse.append(maxse)
 
-    return np.mean(individual_mse)
+    return np.mean(individual_mse), np.max(individual_maxse)
