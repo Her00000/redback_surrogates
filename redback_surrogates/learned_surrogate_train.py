@@ -86,7 +86,7 @@ def train_pytorch_model(
     dataset,
     hidden_sizes=[64, 64],
     training_epochs=100,
-    scale_output=True,
+    verbose=False,
 ):
     """Trains a simple neural network surrogate model using PyTorch.
 
@@ -99,6 +99,8 @@ def train_pytorch_model(
     hidden_sizes : int or list of int, optional
         The size(s) of the hidden layers in the neural network.
         Default is a pair of 64 node layers.
+    verbose : bool, optional
+        Whether to print training progress. Default is False.
 
     Returns
     -------
@@ -124,8 +126,9 @@ def train_pytorch_model(
     criterion = nn.MSELoss()  # Mean Squared Error for regression
     optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 
-    print("Starting training...")
-    for _ in tqdm(range(training_epochs)):
+    if verbose:
+        print("Starting training...")
+    for idx in tqdm(range(training_epochs)):
         # Forward pass
         outputs = model(*input_vals)
         loss = criterion(outputs, output)
@@ -134,6 +137,9 @@ def train_pytorch_model(
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        if verbose and (idx + 1) % 10 == 0:
+            print(f"Epoch {idx + 1}/{training_epochs}, Loss: {loss.item()}")
 
     # Create a LearnedSurrogateModel from the trained PyTorch model.
     input_example = tuple(input_vals[:, 0])
@@ -150,3 +156,34 @@ def train_pytorch_model(
         param_names=dataset.parameter_names,
     )
     return surrogate_model
+
+
+def evaluate_learned_model(model, dataset):
+    """Evaluates a trained LearnedSurrogateModel model on a given LearnedSurrogateDataset.
+    Primarily used for computing test set error.
+
+    Parameters
+    ----------
+    model : LearnedSurrogateModel
+        The trained surrogate model.
+    dataset : LearnedSurrogateDataset
+        The dataset containing the evaluation data.
+
+    Returns
+    -------
+    float
+        The mean squared error of the model on the dataset.
+    """
+    individual_mse = []
+    for idx in range(len(dataset)):
+        input_params = dataset.get_input_dict(idx)
+        true_output = dataset.get_output(idx)
+
+        # Get the model prediction
+        predicted_output = model.predict_spectra_grid(**input_params)
+
+        # Compute MSE for this sample
+        mse = np.mean((predicted_output - true_output) ** 2)
+        individual_mse.append(mse)
+
+    return np.mean(individual_mse)
