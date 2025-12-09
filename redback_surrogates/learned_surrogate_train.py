@@ -86,6 +86,7 @@ def train_pytorch_model(
     dataset,
     hidden_sizes=[64, 64],
     training_epochs=100,
+    verbose=False,
     scale_output=True,
 ):
     """Trains a simple neural network surrogate model using PyTorch.
@@ -99,6 +100,11 @@ def train_pytorch_model(
     hidden_sizes : int or list of int, optional
         The size(s) of the hidden layers in the neural network.
         Default is a pair of 64 node layers.
+    verbose : bool, optional
+        Whether to print training progress. Default is False.
+    scale_output : bool, optional
+        Whether to scale the output to [0, 1] during training and add
+        inverse scaling to the ONNX model. Default is True.
 
     Returns
     -------
@@ -113,6 +119,19 @@ def train_pytorch_model(
     max_vals = torch.max(input_vals, dim=1).values
     output = torch.tensor(dataset.get_output(), dtype=torch.float64)
 
+    # Scale the output to [0, 1] for training if requested
+    if scale_output:
+        output_min = torch.min(output)
+        output_max = torch.max(output)
+        output_range = output_max - output_min
+        if output_range == 0:
+            output_range = torch.tensor(1.0, dtype=torch.float64)
+        output_scaled = (output - output_min) / output_range
+    else:
+        output_scaled = output
+        output_min = torch.tensor(0.0, dtype=torch.float64)
+        output_range = torch.tensor(1.0, dtype=torch.float64)
+
     # Configure the model and training.
     model = NormalizedMultilevelSigmoid(
         input_size=len(dataset.parameter_names),
@@ -124,16 +143,20 @@ def train_pytorch_model(
     criterion = nn.MSELoss()  # Mean Squared Error for regression
     optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 
-    print("Starting training...")
-    for _ in tqdm(range(training_epochs)):
+    if verbose:
+        print("Starting training...")
+    for idx in tqdm(range(training_epochs)):
         # Forward pass
         outputs = model(*input_vals)
-        loss = criterion(outputs, output)
+        loss = criterion(outputs, output_scaled)
 
         # Backward pass and optimization
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        if verbose and (idx + 1) % 5 == 0:
+            print(f"Epoch {idx + 1}/{training_epochs}, Loss: {loss.item()}")
 
     # Create a LearnedSurrogateModel from the trained PyTorch model.
     input_example = tuple(input_vals[:, 0])
@@ -143,10 +166,143 @@ def train_pytorch_model(
         input_names=dataset.parameter_names,
         dynamo=True,
     )
+    
+    # Add inverse scaling to the ONNX model if output was scaled
+    if scale_output:
+        onnx_model = add_output_scaling_and_shift(
+            onnx_program.model_proto,
+            scaling_factor=output_range.item(),
+            shift=output_min.item(),
+        )
+    else:
+        onnx_model = onnx_program.model_proto
+    
     surrogate_model = LearnedSurrogateModel(
-        onnx_program.model_proto,
+        onnx_model,
         times=dataset.times,
         wavelengths=dataset.wavelengths,
         param_names=dataset.parameter_names,
     )
     return surrogate_model
+
+
+def add_output_scaling_and_shift(onnx_model, scaling_factor, shift=0.0):
+    """Add a scaling and shift operation to the output of an ONNX model.
+    
+    The transformation applied is: output_final = (output * scaling_factor) + shift
+    
+    Parameters
+    ----------
+    onnx_model : onnx.ModelProto
+        The ONNX model to modify.
+    scaling_factor : float
+        The scaling factor to multiply the output by.
+    shift : float, optional
+        The additive shift to apply after scaling. Default is 0.0.
+    
+    Returns
+    -------
+    onnx.ModelProto
+        The modified ONNX model with scaling and shift applied to the output.
+    """
+    try:
+        import onnx
+        from onnx import helper, numpy_helper
+    except ImportError as err:
+        raise ImportError(
+            "The onnx package is required to modify the ONNX model. "
+            "Please install it using 'pip install onnx'."
+        ) from err
+
+    # Get the graph
+    graph = onnx_model.graph
+    
+    # Get the original output name and use it to derive intermediate output names
+    original_output_name = graph.output[0].name
+    unscaled_output_name = original_output_name + "_unscaled"
+    scaled_output_name = original_output_name + "_scaled"
+
+    # Rename the model's original output to the intermediate name
+    for node in graph.node:
+        for i, output_name in enumerate(node.output):
+            if output_name == original_output_name:
+                node.output[i] = unscaled_output_name
+
+    # Create a constant tensor for the scaling factor
+    scale_tensor = numpy_helper.from_array(
+        np.array([scaling_factor], dtype=np.float64),
+        name="output_scaling_factor"
+    )
+    graph.initializer.append(scale_tensor)
+
+    # Create a Mul node to multiply the output by the scaling factor
+    mul_node = helper.make_node(
+        'Mul',
+        inputs=[unscaled_output_name, 'output_scaling_factor'],
+        outputs=[scaled_output_name],
+        name='output_scaling'
+    )
+    graph.node.append(mul_node)
+
+    # Create a constant tensor for the shift
+    shift_tensor = numpy_helper.from_array(
+        np.array([shift], dtype=np.float64),
+        name="output_shift"
+    )
+    graph.initializer.append(shift_tensor)
+
+    # Create an Add node to add the shift
+    add_node = helper.make_node(
+        'Add',
+        inputs=[scaled_output_name, 'output_shift'],
+        outputs=[original_output_name],
+        name='output_shift_add'
+    )
+    graph.node.append(add_node)
+
+    # Update the graph output to keep the original output name
+    graph.output[0].name = original_output_name
+
+    # Run ONNX checker to validate the modified model
+    onnx.checker.check_model(onnx_model)
+
+    return onnx_model
+
+
+def evaluate_learned_model(model, dataset):
+    """Evaluates a trained LearnedSurrogateModel model on a given
+    LearnedSurrogateDataset.
+
+    Primarily used for computing test set error.
+
+    Parameters
+    ----------
+    model : LearnedSurrogateModel
+        The trained surrogate model.
+    dataset : LearnedSurrogateDataset
+        The dataset containing the evaluation data.
+
+    Returns
+    -------
+    float
+        The mean squared error of the model on the dataset.
+    float
+        The max squared error of the model on the dataset.
+    """
+    individual_mse = []
+    individual_maxse = []
+    for idx in range(len(dataset)):
+        input_params = dataset.get_input_dict(idx)
+        true_output = dataset.get_output(idx)
+
+        # Get the model prediction
+        predicted_output = model.predict_spectra_grid(**input_params)
+
+        # Compute MSE for this sample
+        sq_error = (predicted_output - true_output) ** 2
+        mse = np.mean(sq_error)
+        maxse = np.max(sq_error)
+        individual_mse.append(mse)
+        individual_maxse.append(maxse)
+
+    return np.mean(individual_mse), np.max(individual_maxse)

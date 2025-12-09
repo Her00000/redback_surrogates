@@ -38,6 +38,10 @@ class TestLearnedSurrogateDataset(unittest.TestCase):
         assert np.array_equal(dataset.get_input(0), np.array([1, 4]))
         assert np.array_equal(dataset.get_input([0, 2]), np.array([[1, 4], [3, 6]]))
 
+        # We can get the input as a dictionary.
+        assert dataset.get_input_dict(0) == {"param1": 1, "param2": 4}
+        assert dataset.get_input_dict(1) == {"param1": 2, "param2": 5}
+
         # We can access the output grids.
         assert dataset.get_output().shape == (3, 2, 3)
         assert np.array_equal(

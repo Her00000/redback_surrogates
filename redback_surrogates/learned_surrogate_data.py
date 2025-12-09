@@ -90,6 +90,15 @@ class LearnedSurrogateDataset:
             [self.data[param][idx] for param in self.parameter_names]
         )
 
+    def get_input_dict(self, idx):
+        """Retrieves the input parameters for a single given index.
+
+        :param idx: An integer specifying the index of the desired data.
+        :return: A dictionary containing the parameter names and their corresponding values.
+        """
+        return {param: self.data[param][idx] for param in self.parameter_names}
+
+
     def get_output(self, idx=None):
         """Retrieves the output (grid) data for a given index or indices.
 
