@@ -56,7 +56,10 @@ class TestLearnedSurrogateTrain(unittest.TestCase):
 
         # Learn a model with a single hidden layer with 8 nodes.
         surrogate_model = train_pytorch_model(
-            dataset, hidden_sizes=8, training_epochs=1000
+            dataset,
+            hidden_sizes=8,
+            training_epochs=1000,
+            learning_rate=0.1,
         )
         assert isinstance(surrogate_model, LearnedSurrogateModel)
         assert np.allclose(surrogate_model.times, times)
@@ -69,6 +72,5 @@ class TestLearnedSurrogateTrain(unittest.TestCase):
         assert np.allclose(grid, _toy_function(0.2, 0.1, -0.1), atol=0.1)
 
         # Evaluate the model on the training data to get MSE and max SE.
-        mse, maxse = evaluate_learned_model(surrogate_model, dataset)
-        assert mse < 0.02
-        assert maxse < 0.1
+        rmse = evaluate_learned_model(surrogate_model, dataset)
+        assert rmse < 0.1

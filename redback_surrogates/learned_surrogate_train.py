@@ -1,4 +1,8 @@
-"""Basic training for LearnedSurrogateModels using a neural network and pytorch."""
+"""Basic training for LearnedSurrogateModels using a neural network and pytorch.
+
+These functions are meant as a proof-of-concept. Each source model will likely need a
+tailored ML architecture and training procedure to get the best results.
+"""
 
 import numpy as np
 import torch
@@ -88,6 +92,7 @@ def train_pytorch_model(
     training_epochs=100,
     verbose=False,
     scale_output=True,
+    learning_rate=0.001,
 ):
     """Trains a simple neural network surrogate model using PyTorch.
 
@@ -105,6 +110,8 @@ def train_pytorch_model(
     scale_output : bool, optional
         Whether to scale the output to [0, 1] during training and add
         inverse scaling to the ONNX model. Default is True.
+    learning_rate : float, optional
+        The learning rate for the optimizer. Default is 0.001.
 
     Returns
     -------
@@ -141,7 +148,7 @@ def train_pytorch_model(
         max_vals=max_vals,
     )
     criterion = nn.MSELoss()  # Mean Squared Error for regression
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     if verbose:
         print("Starting training...")
@@ -271,7 +278,7 @@ def add_output_scaling_and_shift(onnx_model, scaling_factor, shift=0.0):
 
 def evaluate_learned_model(model, dataset):
     """Evaluates a trained LearnedSurrogateModel model on a given
-    LearnedSurrogateDataset.
+    LearnedSurrogateDataset using root mean square error (RMSE).
 
     Primarily used for computing test set error.
 
@@ -285,12 +292,9 @@ def evaluate_learned_model(model, dataset):
     Returns
     -------
     float
-        The mean squared error of the model on the dataset.
-    float
-        The max squared error of the model on the dataset.
+        The mean root mean squared error (RMSE) of the model on the dataset.
     """
-    individual_mse = []
-    individual_maxse = []
+    individual_rmse = []
     for idx in range(len(dataset)):
         input_params = dataset.get_input_dict(idx)
         true_output = dataset.get_output(idx)
@@ -300,9 +304,7 @@ def evaluate_learned_model(model, dataset):
 
         # Compute MSE for this sample
         sq_error = (predicted_output - true_output) ** 2
-        mse = np.mean(sq_error)
-        maxse = np.max(sq_error)
-        individual_mse.append(mse)
-        individual_maxse.append(maxse)
+        rmse = np.sqrt(np.mean(sq_error))
+        individual_rmse.append(rmse)
 
-    return np.mean(individual_mse), np.max(individual_maxse)
+    return np.mean(individual_rmse)
