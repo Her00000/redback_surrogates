@@ -1,7 +1,9 @@
 """Basic training for LearnedSurrogateModels using a neural network and pytorch.
 
 These functions are meant as a proof-of-concept. Each source model will likely need a
-tailored ML architecture and training procedure to get the best results.
+tailored ML architecture and training procedure to get the best results. See
+examples/example_arnett_training.py for an example of a (small) extension to this
+approach.
 """
 
 import numpy as np
@@ -14,7 +16,10 @@ from redback_surrogates.learned_surrogate import LearnedSurrogateModel
 
 
 class NormalizedMultilevelSigmoid(nn.Module):
-    """Wrapper that combines input normalization with the neural network."""
+    """Wrapper that combines input normalization with the neural network.
+    
+    Assumes all outputs have been shifted and scaled so as to fall in the range [0, 1].
+    """
 
     def __init__(
         self,
@@ -71,7 +76,10 @@ class NormalizedMultilevelSigmoid(nn.Module):
             self.lin_layers.append(nn.Linear(prev_size, curr_size))
             self.sigmoid_layers.append(nn.Sigmoid())
             prev_size = curr_size
-        self.out_layer = nn.Linear(prev_size, output_shape[0] * output_shape[1])
+
+        # Make the last layer a sigmoid to keep outputs in the range.
+        self.pre_out_layer = nn.Linear(prev_size, output_shape[0] * output_shape[1])
+        self.out_layer = nn.Sigmoid()
 
     def forward(self, *params):
         x = torch.column_stack(params)
@@ -81,7 +89,7 @@ class NormalizedMultilevelSigmoid(nn.Module):
         # Propagate through each layer of the network
         for lin, sigmoid in zip(self.lin_layers, self.sigmoid_layers):
             x = sigmoid(lin(x))
-        x = self.out_layer(x)
+        x = self.out_layer(self.pre_out_layer(x))
         x = x.view(-1, *self.output_shape)
         return x
 
@@ -91,7 +99,6 @@ def train_pytorch_model(
     hidden_sizes=[64, 64],
     training_epochs=100,
     verbose=False,
-    scale_output=True,
     learning_rate=0.001,
 ):
     """Trains a simple neural network surrogate model using PyTorch.
@@ -107,9 +114,6 @@ def train_pytorch_model(
         Default is a pair of 64 node layers.
     verbose : bool, optional
         Whether to print training progress. Default is False.
-    scale_output : bool, optional
-        Whether to scale the output to [0, 1] during training and add
-        inverse scaling to the ONNX model. Default is True.
     learning_rate : float, optional
         The learning rate for the optimizer. Default is 0.001.
 
@@ -126,18 +130,13 @@ def train_pytorch_model(
     max_vals = torch.max(input_vals, dim=1).values
     output = torch.tensor(dataset.get_output(), dtype=torch.float64)
 
-    # Scale the output to [0, 1] for training if requested
-    if scale_output:
-        output_min = torch.min(output)
-        output_max = torch.max(output)
-        output_range = output_max - output_min
-        if output_range == 0:
-            output_range = torch.tensor(1.0, dtype=torch.float64)
-        output_scaled = (output - output_min) / output_range
-    else:
-        output_scaled = output
-        output_min = torch.tensor(0.0, dtype=torch.float64)
+    # Scale the output to [0, 1] for training
+    output_min = torch.min(output)
+    output_max = torch.max(output)
+    output_range = output_max - output_min
+    if output_range == 0:
         output_range = torch.tensor(1.0, dtype=torch.float64)
+    output_scaled = (output - output_min) / output_range
 
     # Configure the model and training.
     model = NormalizedMultilevelSigmoid(
@@ -163,7 +162,7 @@ def train_pytorch_model(
         optimizer.step()
 
         if verbose and (idx + 1) % 5 == 0:
-            print(f"Epoch {idx + 1}/{training_epochs}, Loss: {loss.item()}")
+            print(f"Epoch {idx + 1}/{training_epochs}, Training Loss (scaled): {loss.item()}")
 
     # Create a LearnedSurrogateModel from the trained PyTorch model.
     input_example = tuple(input_vals[:, 0])
@@ -175,15 +174,12 @@ def train_pytorch_model(
     )
     
     # Add inverse scaling to the ONNX model if output was scaled
-    if scale_output:
-        onnx_model = add_output_scaling_and_shift(
-            onnx_program.model_proto,
-            scaling_factor=output_range.item(),
-            shift=output_min.item(),
-        )
-    else:
-        onnx_model = onnx_program.model_proto
-    
+    onnx_model = add_output_scaling_and_shift(
+        onnx_program.model_proto,
+        scaling_factor=output_range.item(),
+        shift=output_min.item(),
+    )
+
     surrogate_model = LearnedSurrogateModel(
         onnx_model,
         times=dataset.times,
