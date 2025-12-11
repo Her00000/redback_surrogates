@@ -111,8 +111,8 @@ def execute(args):
 
     # The min and max values for each parameter come from the predefined ranges used.
     # If you change the parameter ranges in generate_arnett_data, update these accordingly.
-    min_vals = torch.tensor([0.1, 0.1, 1.0, 1_000, 0.05, 0.02, 2000.0], dtype=torch.float64)
-    max_vals = torch.tensor([1.0, 1.0, 20.0, 5_000, 0.25, 0.05, 10000.0], dtype=torch.float64)
+    min_vals = torch.tensor([0.1, 1.0, 1_000, 0.05, 0.02, 2000.0], dtype=torch.float64)
+    max_vals = torch.tensor([1.0, 20.0, 5_000, 0.25, 0.05, 10000.0], dtype=torch.float64)
 
     # Configure the model and training.
     model = NormalizedMultilevelSigmoid(
