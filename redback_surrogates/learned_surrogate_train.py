@@ -133,10 +133,14 @@ def train_pytorch_model(
     # Scale the output to [0, 1] for training
     output_min = torch.min(output)
     output_max = torch.max(output)
-    output_range = output_max - output_min
+    output_range = (output_max - output_min) * 1.25  # Avoid boundary issues
     if output_range == 0:
         output_range = torch.tensor(1.0, dtype=torch.float64)
     output_scaled = (output - output_min) / output_range
+    if verbose:
+        print(f"Output bounds [{output_min}, {output_max}]")
+        print(f"Shifting output by {output_min} and scaling by {output_range}.")
+        print(f"Scaled bounds [{torch.min(output_scaled)}, {torch.max(output_scaled)}]")
 
     # Configure the model and training.
     model = NormalizedMultilevelSigmoid(

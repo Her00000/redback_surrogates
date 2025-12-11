@@ -19,6 +19,7 @@ import argparse
 
 import numpy as np
 
+from astropy.cosmology import Planck18
 from astropy.table import Table
 from redback.transient_models.supernova_models import arnett_with_features
 import torch
@@ -33,11 +34,11 @@ from redback_surrogates.learned_surrogate_train import (
 )
 
 # We scale the output to improve training stability.
-_OUTPUT_SCALE = 1e11
+_OUTPUT_SCALE = 1e-41
 
 def generate_arnett_data(num_samples, output_scale=1.0):
     """Generate training/validation data for the Arnett model with
-    randomly sampled parameters and outputs as the spectra.
+    randomly sampled parameters and outputs as the luminosity density.
 
     :param num_samples: Number of samples to generate.
     :param output_scale: Scale factor to apply to the output grids.
@@ -45,10 +46,9 @@ def generate_arnett_data(num_samples, output_scale=1.0):
     """
     times = np.array([0.0, 1.0])  # Unused by "spectra" output type
 
-    # Generate the parameter samples. We use a restricted range from
-    # the full set of priors provides by redback to simplify training.
+    # Generate the parameter samples. For the simplicity of the example,
+    # we use much smaller ranges than the full priors provided by redback.
     data = {
-        "redshift": np.random.uniform(0.1, 1.0, size=num_samples),
         "f_nickel": np.random.uniform(0.1, 1.0, size=num_samples),
         "mej": np.random.uniform(1.0, 20.0, size=num_samples),
         "vej": np.random.uniform(1_000, 5_000, size=num_samples),
@@ -57,6 +57,10 @@ def generate_arnett_data(num_samples, output_scale=1.0):
         "temperature_floor": np.random.uniform(2000.0, 10000.0, size=num_samples),
     }
 
+    # Precompute the luminosity distance for the given redshift.
+    redshift = 1e-8  # Small, but non-zero, redshift.
+    lum_dist = Planck18.luminosity_distance(redshift).to('cm').value
+
     # Compute the output for each sample.
     output_grids = []
     out_times = None
@@ -64,7 +68,7 @@ def generate_arnett_data(num_samples, output_scale=1.0):
     for i in range(num_samples):
         grid = arnett_with_features(
             time=times,
-            redshift=data["redshift"][i],
+            redshift=redshift,  # Small fixed redshift
             f_nickel=data["f_nickel"][i],
             mej=data["mej"][i],
             vej=data["vej"][i],
@@ -73,7 +77,11 @@ def generate_arnett_data(num_samples, output_scale=1.0):
             temperature_floor=data["temperature_floor"][i],
             output_format="spectra",
         )
-        output_grids.append(grid.spectra)
+        
+        # Convert flux density (erg/s/cm²/Å) to luminosity density (erg/s/Å)
+        # Using: L_λ = F_λ × 4π × D_L²
+        luminosity_density = grid.spectra * 4 * np.pi * lum_dist**2
+        output_grids.append(luminosity_density)
 
         # Save the time and wavelength grid from the first sample.
         if i == 0:
