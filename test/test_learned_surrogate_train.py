@@ -67,10 +67,10 @@ class TestLearnedSurrogateTrain(unittest.TestCase):
         assert surrogate_model.param_names == ["x", "y", "z"]
 
         # Test that the surrogate model produces outputs of the correct shape.
-        grid = surrogate_model.predict_spectra_grid(x=0.2, y=0.1, z=0.1)
+        grid = surrogate_model.predict_spectra_grid(x=0.2, y=0.1, z=0.6)
         assert grid.shape == (2, 3)
 
-        assert np.allclose(grid, _toy_function(0.2, 0.1, 0.1), atol=0.1)
+        assert np.allclose(grid, _toy_function(0.2, 0.1, 0.6), atol=0.1)
 
         # Evaluate the model on the training data to get MSE and max SE.
         rmse = evaluate_learned_model(surrogate_model, dataset)

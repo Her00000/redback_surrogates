@@ -130,10 +130,11 @@ def train_pytorch_model(
     max_vals = torch.max(input_vals, dim=1).values
     output = torch.tensor(dataset.get_output(), dtype=torch.float64)
 
-    # Scale the output to [0, 1] for training
+    # Scale the output for training. We use a 25% margin to avoid
+    # issues when the output sample doesn't match the full output range.
     output_min = torch.min(output)
     output_max = torch.max(output)
-    output_range = (output_max - output_min) * 1.25  # Avoid boundary issues
+    output_range = (output_max - output_min) * 1.25
     if output_range == 0:
         output_range = torch.tensor(1.0, dtype=torch.float64)
     output_scaled = (output - output_min) / output_range
