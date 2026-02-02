@@ -1,5 +1,12 @@
-from redback_surrogates import afterglowmodels, kilonovamodels, supernovamodels
+from redback_surrogates import afterglowmodels, supernovamodels
 from inspect import getmembers, isfunction
+
+try:
+    from redback_surrogates import kilonovamodels
+except Exception as e:  # pragma: no cover - optional dependency
+    kilonovamodels = None
+    import warnings
+    warnings.warn(f"kilonovamodels unavailable: {e}")
 def get_functions_dict(module):
     models_dict = {}
     _functions_list = [o for o in getmembers(module) if isfunction(o[1])]
@@ -7,7 +14,9 @@ def get_functions_dict(module):
     models_dict[module.__name__.split('.')[-1]] = _functions_dict
     return models_dict
 
-modules = [afterglowmodels, kilonovamodels, supernovamodels]
+modules = [afterglowmodels, supernovamodels]
+if kilonovamodels is not None:
+    modules.insert(1, kilonovamodels)
 
 all_models_dict = dict()
 modules_dict = dict()
