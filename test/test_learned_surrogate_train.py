@@ -34,7 +34,7 @@ class TestLearnedSurrogateTrain(unittest.TestCase):
         np.random.seed(42)  # Set the seed for reproducibility
         x_vals = 0.5 * np.random.rand(num_samples)
         y_vals = 0.5 * np.random.rand(num_samples)
-        z_vals = np.random.rand(num_samples) - 0.5
+        z_vals = np.random.rand(num_samples) + 0.5
         params = {
             "x": x_vals,
             "y": y_vals,
@@ -56,7 +56,10 @@ class TestLearnedSurrogateTrain(unittest.TestCase):
 
         # Learn a model with a single hidden layer with 8 nodes.
         surrogate_model = train_pytorch_model(
-            dataset, hidden_sizes=8, training_epochs=1000
+            dataset,
+            hidden_sizes=8,
+            training_epochs=1000,
+            learning_rate=0.1,
         )
         assert isinstance(surrogate_model, LearnedSurrogateModel)
         assert np.allclose(surrogate_model.times, times)
@@ -64,11 +67,11 @@ class TestLearnedSurrogateTrain(unittest.TestCase):
         assert surrogate_model.param_names == ["x", "y", "z"]
 
         # Test that the surrogate model produces outputs of the correct shape.
-        grid = surrogate_model.predict_spectra_grid(x=0.2, y=0.1, z=-0.1)
+        grid = surrogate_model.predict_spectra_grid(x=0.2, y=0.1, z=0.6)
         assert grid.shape == (2, 3)
-        assert np.allclose(grid, _toy_function(0.2, 0.1, -0.1), atol=0.1)
+
+        assert np.allclose(grid, _toy_function(0.2, 0.1, 0.6), atol=0.1)
 
         # Evaluate the model on the training data to get MSE and max SE.
-        mse, maxse = evaluate_learned_model(surrogate_model, dataset)
-        assert mse < 0.02
-        assert maxse < 0.1
+        rmse = evaluate_learned_model(surrogate_model, dataset)
+        assert rmse < 0.1
