@@ -5,8 +5,10 @@ channels:
 dependencies:
   - python=3.11
   - setuptools
-  - sphinx-tabs
   - sphinx-rtd-theme
+  - pip
+  - pip:
+    - sphinx-tabs
   - numpy<2.0
   - astropy
   - matplotlib

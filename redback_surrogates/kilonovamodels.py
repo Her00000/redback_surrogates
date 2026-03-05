@@ -1,4 +1,7 @@
 import numpy as np
+# numpy 2.0 removed trapz; patch before importing kilonovanet which still uses it
+if not hasattr(np, 'trapz'):
+    np.trapz = np.trapezoid
 import kilonovanet as knnet
 from collections import namedtuple
 from redback_surrogates.utils import citation_wrapper, convert_to_observer_frame

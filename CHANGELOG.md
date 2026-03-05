@@ -1,5 +1,13 @@
 # All notable changes will be documented in this file
 
+## [0.2.7] 2026-03-05
+Version 0.2.7 release of `redback_surrogates`
+
+### Fixed
+- Add numpy 2.x compatibility shim before importing `kilonovanet`, which still
+  uses the removed `numpy.trapz`. Patches `np.trapz = np.trapezoid` at import
+  time so kilonovanet works with numpy >= 2.0 (Python 3.13+).
+
 ## [0.2.6] 2025-08-28
 Version 0.2.6 release of `redback_surrogates`
 
