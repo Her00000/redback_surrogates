@@ -8,11 +8,80 @@ import pandas as pd
 import astropy.units as uu
 from functools import lru_cache
 import os
+import warnings
+import copy
 import h5py
 import torch
 import torch.nn as nn
 dirname = os.path.dirname(__file__)
 data_folder = os.path.join(dirname, "surrogate_data")
+
+
+def _resolve_torch_device(device=None):
+    """
+    Resolve torch execution device.
+
+    Default behavior is GPU-first (CUDA, then MPS) with CPU fallback.
+    """
+    if isinstance(device, torch.device):
+        requested = str(device)
+    elif device is None:
+        requested = "auto"
+    else:
+        requested = str(device).strip().lower()
+
+    if requested in ("", "none", "auto", "gpu"):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    try:
+        resolved = torch.device(requested)
+    except (TypeError, RuntimeError, ValueError):
+        warnings.warn(
+            f"Unknown torch device '{device}', falling back to CPU.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return torch.device("cpu")
+
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        warnings.warn(
+            f"CUDA device '{device}' requested but CUDA is unavailable; falling back to CPU.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return torch.device("cpu")
+    if resolved.type == "mps" and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ):
+        warnings.warn(
+            f"MPS device '{device}' requested but MPS is unavailable; falling back to CPU.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return torch.device("cpu")
+    return resolved
+
+
+def _canonical_device_key(device):
+    """Return a stable device key for cache indexing."""
+    dev = _resolve_torch_device(device)
+    if dev.type == "cuda":
+        idx = dev.index
+        if idx is None:
+            idx = torch.cuda.current_device()
+        return f"cuda:{idx}"
+    return dev.type
+
+
+def _to_numpy_array(x):
+    """Convert tensor/array-like to numpy array on CPU."""
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 @citation_wrapper("https://ui.adsabs.harvard.edu/abs/2025arXiv250602107S/abstract, https://ui.adsabs.harvard.edu/abs/2023PASJ...75..634M/abstract")
 class EnhancedSpectralModel:
@@ -324,10 +393,10 @@ def typeII_spectra(progenitor, ni_mass, log10_mdot, beta, rcsm, esn, **kwargs):
     )
 
 
-# ========== LOWME (Latent-space Optimized Waveform Emulator) Model ==========
+# ========== Interaction-Model ==========
 
-class _LowmeResBlock(nn.Module):
-    """Pre-activation ResNet Block with SiLU for LOWME"""
+class _InteractionResBlock(nn.Module):
+    """Pre-activation ResNet block with SiLU for Interaction-Model."""
     def __init__(self, dim):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -343,48 +412,37 @@ class _LowmeResBlock(nn.Module):
         return x + h
 
 
-class _LowmePhysicsEmbedding(nn.Module):
-    """Physics parameter embedding for LOWME"""
+class _InteractionPhysicsEmbedding(nn.Module):
+    """Physics parameter embedding for Interaction-Model."""
     def forward(self, x):
-        # Ensure 2D input
         if x.dim() == 1:
             x = x.unsqueeze(0)
-        feats = [x]
-        feats.append(x ** 2)
-        feats.append(torch.tanh(x))
-        feats.append(torch.log(torch.abs(x) + 1.1))
+        feats = [x, x ** 2, torch.tanh(x), torch.log(torch.abs(x) + 1.1)]
         if x.shape[1] >= 2:
             feats.append(x[:, 0:1] * x[:, 1:2])
         return torch.cat(feats, dim=1)
 
 
-class LowmeLatentEmulator(nn.Module):
-    """LOWME Latent Emulator: predicts latent codes from physical parameters"""
+class InteractionLatentEmulator(nn.Module):
+    """Interaction-Model latent emulator."""
     def __init__(self, input_dim, latent_dim, hidden_dim=1024, num_blocks=12):
         super().__init__()
-        
         self.register_buffer('x_mean', torch.zeros(input_dim))
         self.register_buffer('x_std', torch.ones(input_dim))
-        
-        self.physics_embed = _LowmePhysicsEmbedding()
+        self.physics_embed = _InteractionPhysicsEmbedding()
         embed_dim = input_dim * 4 + 1
-        
         self.input_proj = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
         )
-        
-        self.blocks = nn.ModuleList([_LowmeResBlock(hidden_dim) for _ in range(num_blocks)])
-        
+        self.blocks = nn.ModuleList([_InteractionResBlock(hidden_dim) for _ in range(num_blocks)])
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, latent_dim),
         )
-        
-        self.latent_dim = latent_dim
-    
+
     def forward(self, x):
         x = (x - self.x_mean) / self.x_std
         x = self.physics_embed(x)
@@ -394,15 +452,15 @@ class LowmeLatentEmulator(nn.Module):
         return self.output_proj(x)
 
 
-class LowmeResNetDecoder(nn.Module):
-    """LOWME ResNet Decoder: decodes latent codes to spectra"""
+class InteractionResNetDecoder(nn.Module):
+    """Interaction-Model decoder."""
     def __init__(self, latent_dim, hidden_dim, output_dim, num_blocks):
         super().__init__()
         self.input_proj = nn.Linear(latent_dim, hidden_dim)
-        self.blocks = nn.ModuleList([_LowmeResBlock(hidden_dim) for _ in range(num_blocks)])
+        self.blocks = nn.ModuleList([_InteractionResBlock(hidden_dim) for _ in range(num_blocks)])
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, output_dim)
-    
+
     def forward(self, z):
         h = self.input_proj(z)
         for block in self.blocks:
@@ -412,24 +470,17 @@ class LowmeResNetDecoder(nn.Module):
 
 
 @lru_cache(maxsize=1)
-def _load_typeII_lowme_torch_bundle():
-    """Load and cache the LOWME (Latent-space Optimized Waveform Emulator) torch surrogate.
-    
-    LOWME uses a two-stage architecture:
-    - Emulator: physical params -> latent code (normalized)
-    - Decoder: latent code -> spectrum (normalized [0,1])
-    """
+def _load_typeII_interaction_model_torch_bundle():
+    """Load and cache the Interaction-Model torch surrogate."""
     directory = os.environ.get(
-        'STELLA_LOWME_DIR',
-        os.path.join(data_folder, 'TypeII_Moriya', 'lowme'),
+        'STELLA_INTERACTION_MODEL_DIR',
+        os.path.join(data_folder, 'TypeII_Moriya', 'interaction_model'),
     )
     ckpt_path = os.path.join(directory, 'emulator_6param_timeweighted_best.pt')
-    
     bundle = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    
+
     cfg = bundle.get('config', {})
     ae_cfg = bundle.get('ae_config', {})
-    
     input_dim = bundle['input_dim']
     latent_dim = bundle['latent_dim']
     flux_min = bundle['flux_min']
@@ -440,20 +491,17 @@ def _load_typeII_lowme_torch_bundle():
     wave_grid = bundle['wave_grid']
     n_time = bundle['n_time']
     n_wave = bundle['n_wave']
-    
-    # Load input normalization: prefer checkpoint, fallback to HDF5
+
     if 'X_mean' in bundle and 'X_std' in bundle:
         X_mean = bundle['X_mean']
         X_std = bundle['X_std']
     else:
-        # Fallback to HDF5 for backward compatibility
         h5_path = '/data/zhangzy/retrain/svd_resnet/preprocessed_data_ae.h5'
         with h5py.File(h5_path, 'r') as f:
             X_mean = f['X_mean'][:input_dim]
             X_std = f['X_std'][:input_dim]
-    
-    # Build Emulator
-    emulator = LowmeLatentEmulator(
+
+    emulator = InteractionLatentEmulator(
         input_dim=input_dim,
         latent_dim=latent_dim,
         hidden_dim=cfg.get('hidden_dim', 1024),
@@ -461,9 +509,8 @@ def _load_typeII_lowme_torch_bundle():
     )
     emulator.load_state_dict(bundle['emulator_state_dict'])
     emulator.eval()
-    
-    # Build Decoder
-    decoder = LowmeResNetDecoder(
+
+    decoder = InteractionResNetDecoder(
         latent_dim=latent_dim,
         hidden_dim=ae_cfg.get('hidden_dim', 1024),
         output_dim=ae_cfg.get('input_dim', 10000),
@@ -471,78 +518,65 @@ def _load_typeII_lowme_torch_bundle():
     )
     decoder.load_state_dict(bundle['decoder_state_dict'])
     decoder.eval()
-    
+
     return emulator, decoder, z_mean, z_std, flux_min, flux_max, time_grid, wave_grid, n_time, n_wave, X_mean, X_std
 
 
-def clear_typeII_lowme_cache():
-    """Clear LOWME model cache to free memory."""
-    _load_typeII_lowme_torch_bundle.cache_clear()
-
-
-
-def typeII_spectra_lowme(progenitor, ni_mass, log10_mdot, beta, rcsm, esn, **kwargs):
-    """Type II spectra using the LOWME (Latent-space Optimized Waveform Emulator) surrogate.
-    
-    This model achieves ~0.95% RMSE on normalized flux (baseline ~5%).
-    
-    Parameters:
-        progenitor: Initial ZAMS mass in solar masses (10-18)
-        ni_mass: Mass of nickel-56 in solar masses (0.001-0.3)
-        log10_mdot: log10 of mass-loss rate in M☉/yr
-        beta: CSM density profile steepness (0.5-5)
-        rcsm: CSM radius in 10^14 cm (1-10, will be multiplied by 1e14)
-        esn: SN explosion energy in 10^51 erg (0.5-5)
-        
-    Returns:
-        output namedtuple with fields:
-        - spectrum: flux in erg/s/Hz (astropy quantity)
-        - frequency: wavelength grid in Angstrom (astropy quantity)
-        - time: time grid in days (astropy quantity)
+@lru_cache(maxsize=4)
+def _load_typeII_interaction_model_torch_bundle_on_device(device_key):
     """
+    Load Interaction-Model bundle on a specific device once and reuse it.
+    """
+    emulator_cpu, decoder_cpu, z_mean_cpu, z_std_cpu, flux_min, flux_max, time_grid, wave_grid, n_time, n_wave, X_mean, X_std = \
+        _load_typeII_interaction_model_torch_bundle()
+    device = torch.device(device_key)
+
+    emulator = copy.deepcopy(emulator_cpu).to(device)
+    emulator.eval()
+    decoder = copy.deepcopy(decoder_cpu).to(device)
+    decoder.eval()
+    z_mean = z_mean_cpu.to(device) if torch.is_tensor(z_mean_cpu) else torch.as_tensor(z_mean_cpu, device=device)
+    z_std = z_std_cpu.to(device) if torch.is_tensor(z_std_cpu) else torch.as_tensor(z_std_cpu, device=device)
+    x_mean_np = _to_numpy_array(X_mean)
+    x_std_np = _to_numpy_array(X_std)
+
+    return emulator, decoder, z_mean, z_std, flux_min, flux_max, time_grid, wave_grid, n_time, n_wave, x_mean_np, x_std_np
+
+
+def clear_typeII_interaction_model_cache():
+    """Clear Interaction-Model cache to free memory."""
+    _load_typeII_interaction_model_torch_bundle.cache_clear()
+    _load_typeII_interaction_model_torch_bundle_on_device.cache_clear()
+
+
+@citation_wrapper("https://ui.adsabs.harvard.edu/abs/2025arXiv250602107S/abstract, https://ui.adsabs.harvard.edu/abs/2023PASJ...75..634M/abstract")
+def typeII_spectra_interaction_model(progenitor, ni_mass, log10_mdot, beta, rcsm, esn, **kwargs):
+    """Type II spectra using the Interaction-Model surrogate."""
     rcsm_cm = rcsm * 1e14
     log10_mdot = np.abs(log10_mdot)
-    
-    device = kwargs.get('device', 'cpu')
-    
+    device_key = _canonical_device_key(kwargs.get('device', 'auto'))
+    device = torch.device(device_key)
+
     emulator, decoder, z_mean, z_std, flux_min, flux_max, time_grid, wave_grid, n_time, n_wave, X_mean, X_std = \
-        _load_typeII_lowme_torch_bundle()
-    
-    emulator = emulator.to(device)
-    decoder = decoder.to(device)
-    z_mean = z_mean.to(device)
-    z_std = z_std.to(device)
-    
-    # Prepare input: [progenitor, ni_mass, log10_mdot, beta, rcsm_cm, esn]
+        _load_typeII_interaction_model_torch_bundle_on_device(device_key)
+
     ss = np.array([progenitor, ni_mass, log10_mdot, beta, rcsm_cm, esn]).T
     if isinstance(progenitor, float):
         ss = ss.reshape(1, -1)
-    
-    # Normalize input using HDF5 statistics
     ss = ((ss - X_mean) / X_std).astype(np.float32)
-    
+
     with torch.no_grad():
         x_tensor = torch.from_numpy(ss).to(device)
-        
-        # Emulator predicts normalized latent code
         z_norm = emulator(x_tensor)
-        
-        # De-normalize latent code
         z = z_norm * z_std + z_mean
-        
-        # Decoder produces normalized spectrum [0, 1]
         pred_norm = decoder(z).cpu().numpy()
-    
-    # Convert to log10(flux)
+
     pred_logf = pred_norm * (flux_max - flux_min) + flux_min
     pred_logf = pred_logf.reshape(pred_logf.shape[0], n_time, n_wave)
-    
     if isinstance(progenitor, float):
         pred_logf = pred_logf[0]
-    
-    # Convert to linear flux with units
+
     pred_flux = (10 ** pred_logf) * uu.erg / uu.s / uu.Hz
-    
     output = namedtuple('output', ['spectrum', 'frequency', 'time'])
     return output(
         spectrum=pred_flux,
@@ -551,25 +585,22 @@ def typeII_spectra_lowme(progenitor, ni_mass, log10_mdot, beta, rcsm, esn, **kwa
     )
 
 
-# Aliases for backward compatibility
-
-
 # ========== Direct Regression Model ==========
 
 class _DirectPhysicsEmbedding(nn.Module):
-    """Physics parameter embedding for Direct Regression"""
+    """Physics parameter embedding for Direct Regression."""
     def forward(self, x):
         if x.dim() == 1:
             x = x.unsqueeze(0)
         feats = [x, x ** 2, torch.tanh(x), torch.log(torch.abs(x) + 1.1)]
         if x.shape[1] >= 2:
-            feats.append(x[:, 0:1] * x[:, 1:2])  # M * Ni interaction
-            feats.append(x[:, 1:2] * x[:, 5:6])  # Ni * Esn interaction
+            feats.append(x[:, 0:1] * x[:, 1:2])
+            feats.append(x[:, 1:2] * x[:, 5:6])
         return torch.cat(feats, dim=1)
 
 
 class _DirectResBlock(nn.Module):
-    """ResNet Block for Direct Regression"""
+    """ResNet block for Direct Regression."""
     def __init__(self, dim, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -577,7 +608,7 @@ class _DirectResBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.fc2 = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(self, x):
         h = torch.nn.functional.silu(self.norm1(x))
         h = self.fc1(h)
@@ -588,31 +619,26 @@ class _DirectResBlock(nn.Module):
 
 
 class DirectSpectrumRegressor(nn.Module):
-    """Direct Regression: physical params -> spectrum (no latent space)"""
+    """Direct Regression: physical parameters to spectrum."""
     def __init__(self, input_dim, output_dim, hidden_dim=2048, num_blocks=16):
         super().__init__()
-        
         self.register_buffer('x_mean', torch.zeros(input_dim))
         self.register_buffer('x_std', torch.ones(input_dim))
-        
         self.physics_embed = _DirectPhysicsEmbedding()
-        embed_dim = input_dim * 4 + 2  # 4 features + 2 interactions
-        
+        embed_dim = input_dim * 4 + 2
         self.input_proj = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
         )
-        
         self.blocks = nn.ModuleList([_DirectResBlock(hidden_dim, dropout=0.1) for _ in range(num_blocks)])
-        
         self.output_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, output_dim),
         )
-    
+
     def forward(self, x):
         x = (x - self.x_mean) / self.x_std
         x = self.physics_embed(x)
@@ -624,22 +650,19 @@ class DirectSpectrumRegressor(nn.Module):
 
 @lru_cache(maxsize=1)
 def _load_typeII_direct_regression():
-    """Load and cache the Direct Regression surrogate.
-    
-    Direct Regression uses a single-stage architecture:
-    - Regressor: physical params -> spectrum (normalized [0,1]) directly
-    """
-    directory = os.environ.get('STELLA_DIRECT_DIR', '/data/zhangzy/retrain/redback_surrogates/surrogate_data/TypeII_Moriya/lowme')
+    """Load and cache the Direct Regression surrogate."""
+    directory = os.environ.get(
+        'STELLA_DIRECT_DIR',
+        '/data/zhangzy/retrain/redback_surrogates/surrogate_data/TypeII_Moriya/interaction_model',
+    )
     ckpt_path = os.path.join(directory, 'direct_regression_best.pt')
-    
     bundle = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    
+
     cfg = bundle.get('config', {})
     input_dim = cfg['n_params']
     output_dim = cfg['output_dim']
     hidden_dim = cfg['hidden_dim']
     num_blocks = cfg['num_blocks']
-    
     flux_min = bundle['flux_min']
     flux_max = bundle['flux_max']
     x_mean = bundle['x_mean']
@@ -648,7 +671,7 @@ def _load_typeII_direct_regression():
     wave_grid = bundle['wave_grid']
     n_time = bundle['n_time']
     n_wave = bundle['n_wave']
-    
+
     model = DirectSpectrumRegressor(
         input_dim=input_dim,
         output_dim=output_dim,
@@ -657,70 +680,54 @@ def _load_typeII_direct_regression():
     )
     model.load_state_dict(bundle['model_state_dict'])
     model.eval()
-    
     return model, flux_min, flux_max, x_mean, x_std, time_grid, wave_grid, n_time, n_wave
 
 
+@lru_cache(maxsize=4)
+def _load_typeII_direct_regression_on_device(device_key):
+    """Load Direct Regression model on a specific device once and reuse it."""
+    model_cpu, flux_min, flux_max, x_mean, x_std, time_grid, wave_grid, n_time, n_wave = \
+        _load_typeII_direct_regression()
+    device = torch.device(device_key)
+    model = copy.deepcopy(model_cpu).to(device)
+    model.eval()
+    x_mean_np = _to_numpy_array(x_mean)
+    x_std_np = _to_numpy_array(x_std)
+    return model, flux_min, flux_max, x_mean_np, x_std_np, time_grid, wave_grid, n_time, n_wave
+
+
 def clear_typeII_direct_cache():
-    """Clear Direct Regression model cache to free memory."""
+    """Clear Direct Regression model cache."""
     _load_typeII_direct_regression.cache_clear()
+    _load_typeII_direct_regression_on_device.cache_clear()
 
 
 @citation_wrapper("https://ui.adsabs.harvard.edu/abs/2025arXiv250602107S/abstract, https://ui.adsabs.harvard.edu/abs/2023PASJ...75..634M/abstract")
 def typeII_spectra_direct_regression(progenitor, ni_mass, log10_mdot, beta, rcsm, esn, **kwargs):
-    """Type II spectra using the Direct Regression surrogate.
-    
-    This model directly predicts spectra from physical parameters without using
-    a latent space representation, for comparison with two-stage approaches.
-    
-    Parameters:
-        progenitor: Initial ZAMS mass in solar masses (10-18)
-        ni_mass: Mass of nickel-56 in solar masses (0.001-0.3)
-        log10_mdot: log10 of mass-loss rate in M☉/yr
-        beta: CSM density profile steepness (0.5-5)
-        rcsm: CSM radius in 10^14 cm (1-10, will be multiplied by 1e14)
-        esn: SN explosion energy in 10^51 erg (0.5-5)
-        
-    Returns:
-        output namedtuple with fields:
-        - spectrum: flux in erg/s/Hz (astropy quantity)
-        - frequency: wavelength grid in Angstrom (astropy quantity)
-        - time: time grid in days (astropy quantity)
-    """
+    """Type II spectra using the Direct Regression surrogate."""
     rcsm_cm = rcsm * 1e14
     log10_mdot = np.abs(log10_mdot)
-    
-    device = kwargs.get('device', 'cpu')
-    
+    device_key = _canonical_device_key(kwargs.get('device', 'auto'))
+    device = torch.device(device_key)
+
     model, flux_min, flux_max, x_mean, x_std, time_grid, wave_grid, n_time, n_wave = \
-        _load_typeII_direct_regression()
-    
-    model = model.to(device)
-    
-    # Prepare input: [progenitor, ni_mass, log10_mdot, beta, rcsm_cm, esn]
+        _load_typeII_direct_regression_on_device(device_key)
+
     ss = np.array([progenitor, ni_mass, log10_mdot, beta, rcsm_cm, esn]).T
     if isinstance(progenitor, float):
         ss = ss.reshape(1, -1)
-    
-    # Normalize input
-    ss = ((ss - x_mean.numpy()) / x_std.numpy()).astype(np.float32)
-    
+    ss = ((ss - x_mean) / x_std).astype(np.float32)
+
     with torch.no_grad():
         x_tensor = torch.from_numpy(ss).to(device)
-        
-        # Direct prediction of normalized spectrum [0, 1]
         pred_norm = model(x_tensor).cpu().numpy()
-    
-    # Convert to log10(flux)
+
     pred_logf = pred_norm * (flux_max - flux_min) + flux_min
     pred_logf = pred_logf.reshape(pred_logf.shape[0], n_time, n_wave)
-    
     if isinstance(progenitor, float):
         pred_logf = pred_logf[0]
-    
-    # Convert to linear flux with units
+
     pred_flux = (10 ** pred_logf) * uu.erg / uu.s / uu.Hz
-    
     output = namedtuple('output', ['spectrum', 'frequency', 'time'])
     return output(
         spectrum=pred_flux,
@@ -729,30 +736,29 @@ def typeII_spectra_direct_regression(progenitor, ni_mass, log10_mdot, beta, rcsm
     )
 
 
-# Alias for convenience
 typeII_spectra_direct = typeII_spectra_direct_regression
 
 
-# ========== CleanModel CNN v3 (2D Convolutional AutoEncoder) ==========
+# ========== Photospheric-Model ==========
 
-class _CleanModelCNN2DEncoder(nn.Module):
-    """CleanModel CNN Encoder: 100x100 -> latent_dim"""
+class _PhotosphericModelCNN2DEncoder(nn.Module):
+    """Photospheric-Model CNN encoder: 100x100 to latent."""
     def __init__(self, latent_dim=256, base_ch=32, bottleneck_size=13):
         super().__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(1, base_ch, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(base_ch), nn.SiLU())
         self.conv2 = nn.Sequential(
-            nn.Conv2d(base_ch, base_ch*2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_ch*2), nn.SiLU())
+            nn.Conv2d(base_ch, base_ch * 2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_ch * 2), nn.SiLU())
         self.conv3 = nn.Sequential(
-            nn.Conv2d(base_ch*2, base_ch*4, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_ch*4), nn.SiLU())
+            nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_ch * 4), nn.SiLU())
         self.conv4 = nn.Sequential(
-            nn.Conv2d(base_ch*4, base_ch*4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_ch*4), nn.SiLU())
+            nn.Conv2d(base_ch * 4, base_ch * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_ch * 4), nn.SiLU())
         self.fc = nn.Linear(base_ch * 4 * bottleneck_size * bottleneck_size, latent_dim)
-        
+
     def forward(self, x):
         x = self.conv1(x)
         x = self.conv2(x)
@@ -761,27 +767,27 @@ class _CleanModelCNN2DEncoder(nn.Module):
         return self.fc(x.view(x.size(0), -1))
 
 
-class _CleanModelCNN2DDecoder(nn.Module):
-    """CleanModel CNN Decoder: latent_dim -> 100x100"""
+class _PhotosphericModelCNN2DDecoder(nn.Module):
+    """Photospheric-Model CNN decoder: latent to 100x100."""
     def __init__(self, latent_dim=256, base_ch=32, bottleneck_size=13):
         super().__init__()
         self.bottleneck_size = bottleneck_size
         self.bottleneck_channels = base_ch * 4
         self.fc = nn.Linear(latent_dim, self.bottleneck_channels * bottleneck_size * bottleneck_size)
         self.up1 = nn.Sequential(
-            nn.Conv2d(base_ch*4, base_ch*4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_ch*4), nn.SiLU())
+            nn.Conv2d(base_ch * 4, base_ch * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_ch * 4), nn.SiLU())
         self.up2 = nn.Sequential(
-            nn.Conv2d(base_ch*4, base_ch*2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_ch*2), nn.SiLU())
+            nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_ch * 2), nn.SiLU())
         self.up3 = nn.Sequential(
-            nn.Conv2d(base_ch*2, base_ch, kernel_size=3, padding=1),
+            nn.Conv2d(base_ch * 2, base_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_ch), nn.SiLU())
         self.up4 = nn.Sequential(
             nn.Conv2d(base_ch, base_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_ch), nn.SiLU())
         self.out_conv = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
-        
+
     def forward(self, z):
         x = self.fc(z).view(-1, self.bottleneck_channels, self.bottleneck_size, self.bottleneck_size)
         x = self.up1(x)
@@ -794,8 +800,8 @@ class _CleanModelCNN2DDecoder(nn.Module):
         return self.out_conv(x)
 
 
-class _CleanModelLatentEmulator(nn.Module):
-    """CleanModel Latent Emulator: physical params -> latent code (no embedding)"""
+class _PhotosphericModelLatentEmulator(nn.Module):
+    """Photospheric-Model latent emulator."""
     def __init__(self, input_dim, latent_dim, hidden_dim=512, num_blocks=8):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -809,7 +815,7 @@ class _CleanModelLatentEmulator(nn.Module):
             ))
         self.blocks = nn.ModuleList(blocks)
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
-        
+
     def forward(self, x):
         if x.dim() == 1:
             x = x.unsqueeze(0)
@@ -820,94 +826,93 @@ class _CleanModelLatentEmulator(nn.Module):
 
 
 @lru_cache(maxsize=1)
-def _load_cleanmodel_cnn_v3():
-    """Load and cache the CleanModel CNN v3 surrogate."""
-    directory = os.path.join(data_folder, 'TypeII_Moriya', 'cleanmodel')
+def _load_photospheric_model_cnn_v3():
+    """Load and cache the Photospheric-Model surrogate."""
+    directory = os.environ.get(
+        'STELLA_PHOTOSPHERIC_MODEL_DIR',
+        os.path.join(data_folder, 'TypeII_Moriya', 'photospheric_model'),
+    )
     ae_path = os.path.join(directory, 'ae_cnn_v3_best.pt')
     emulator_path = os.path.join(directory, 'emulator_cnn_v3_6param_best.pt')
-    
     ae_ckpt = torch.load(ae_path, map_location='cpu', weights_only=False)
     em_ckpt = torch.load(emulator_path, map_location='cpu', weights_only=False)
-    
+
     latent_dim = ae_ckpt['latent_dim']
     base_ch = ae_ckpt['base_channels']
     bottleneck_size = ae_ckpt['bottleneck_size']
     Y_min, Y_max = ae_ckpt['Y_min'], ae_ckpt['Y_max']
     wave_grid, time_grid = ae_ckpt['wave_grid'], ae_ckpt['time_grid']
-    
-    decoder = _CleanModelCNN2DDecoder(latent_dim, base_ch, bottleneck_size)
-    # Extract decoder weights from full model
-    decoder_state = {k.replace('decoder.', ''): v for k, v in ae_ckpt['model_state_dict'].items() if k.startswith('decoder.')}
+
+    decoder = _PhotosphericModelCNN2DDecoder(latent_dim, base_ch, bottleneck_size)
+    decoder_state = {
+        k.replace('decoder.', ''): v
+        for k, v in ae_ckpt['model_state_dict'].items()
+        if k.startswith('decoder.')
+    }
     decoder.load_state_dict(decoder_state)
     decoder.eval()
-    
+
     input_dim = em_ckpt['input_dim']
     hidden_dim = em_ckpt['hidden_dim']
     num_blocks = em_ckpt['num_blocks']
     z_mean, z_std = em_ckpt['z_mean'], em_ckpt['z_std']
     X_mean, X_std = em_ckpt['X_mean'], em_ckpt['X_std']
-    
-    emulator = _CleanModelLatentEmulator(input_dim, latent_dim, hidden_dim, num_blocks)
+
+    emulator = _PhotosphericModelLatentEmulator(input_dim, latent_dim, hidden_dim, num_blocks)
     emulator.load_state_dict(em_ckpt['emulator_state_dict'])
     emulator.eval()
-    
     return emulator, decoder, z_mean, z_std, Y_min, Y_max, wave_grid, time_grid, X_mean, X_std
 
 
-def clear_cleanmodel_cache():
-    """Clear CleanModel cache to free memory."""
-    _load_cleanmodel_cnn_v3.cache_clear()
+@lru_cache(maxsize=4)
+def _load_photospheric_model_cnn_v3_on_device(device_key):
+    """Load Photospheric-Model bundle on a specific device once and reuse it."""
+    emulator_cpu, decoder_cpu, z_mean_cpu, z_std_cpu, Y_min, Y_max, wave_grid, time_grid, X_mean, X_std = \
+        _load_photospheric_model_cnn_v3()
+    device = torch.device(device_key)
+
+    emulator = copy.deepcopy(emulator_cpu).to(device)
+    emulator.eval()
+    decoder = copy.deepcopy(decoder_cpu).to(device)
+    decoder.eval()
+    z_mean = z_mean_cpu.to(device) if torch.is_tensor(z_mean_cpu) else torch.as_tensor(z_mean_cpu, device=device)
+    z_std = z_std_cpu.to(device) if torch.is_tensor(z_std_cpu) else torch.as_tensor(z_std_cpu, device=device)
+    x_mean_np = _to_numpy_array(X_mean)
+    x_std_np = _to_numpy_array(X_std)
+
+    return emulator, decoder, z_mean, z_std, Y_min, Y_max, wave_grid, time_grid, x_mean_np, x_std_np
+
+
+def clear_typeII_photospheric_model_cache():
+    """Clear Photospheric-Model cache to free memory."""
+    _load_photospheric_model_cnn_v3.cache_clear()
+    _load_photospheric_model_cnn_v3_on_device.cache_clear()
 
 
 @citation_wrapper("https://ui.adsabs.harvard.edu/abs/2025arXiv250602107S/abstract, https://ui.adsabs.harvard.edu/abs/2023PASJ...75..634M/abstract")
-def typeII_spectra_cleanmodel(mass, ni_mass, mixing, energy, Menv, R0, **kwargs):
-    """Type II spectra using the CleanModel CNN v3 surrogate.
-    
-    CleanModel uses a 2D Convolutional AutoEncoder architecture for improved
-    spectral structure preservation with time-weighted loss.
-    
-    Parameters:
-        mass: Progenitor ZAMS mass in solar masses (10-18)
-        ni_mass: Mass of nickel-56 in solar masses (0.0001-0.3)
-        mixing: Mixing code (0=cm, 1=fm, 2=hm) or continuous (0-2)
-        energy: Explosion energy in 10^51 erg (0.2-5)
-        Menv: Envelope mass in solar masses (7.2-9.5)
-        R0: Initial radius in solar radii (510-970)
-        
-    Returns:
-        output namedtuple with fields:
-        - spectrum: flux in erg/s/Hz (astropy quantity)
-        - frequency: wavelength grid in Angstrom (astropy quantity)
-        - time: time grid in days (astropy quantity)
-    """
-    device = kwargs.get('device', 'cpu')
-    
-    emulator, decoder, z_mean, z_std, Y_min, Y_max, wave_grid, time_grid, X_mean, X_std = _load_cleanmodel_cnn_v3()
-    
-    emulator = emulator.to(device)
-    decoder = decoder.to(device)
-    z_mean = z_mean.to(device)
-    z_std = z_std.to(device)
-    
-    # Input: [mass, ni_mass, mixing, energy, Menv, R0]
+def typeII_spectra_photospheric_model(mass, ni_mass, mixing, energy, Menv, R0, **kwargs):
+    """Type II spectra using the Photospheric-Model surrogate."""
+    device_key = _canonical_device_key(kwargs.get('device', 'auto'))
+    device = torch.device(device_key)
+    emulator, decoder, z_mean, z_std, Y_min, Y_max, wave_grid, time_grid, X_mean, X_std = \
+        _load_photospheric_model_cnn_v3_on_device(device_key)
+
     ss = np.array([mass, ni_mass, mixing, energy, Menv, R0]).T
     if isinstance(mass, float):
         ss = ss.reshape(1, -1)
     ss = ((ss - X_mean) / X_std).astype(np.float32)
-    
+
     with torch.no_grad():
         x_tensor = torch.from_numpy(ss).to(device)
         z_norm = emulator(x_tensor)
         z = z_norm * z_std + z_mean
-        pred_norm = decoder(z).squeeze(1).cpu().numpy()  # Remove channel dim
-    
+        pred_norm = decoder(z).squeeze(1).cpu().numpy()
+
     pred_logf = pred_norm * (Y_max - Y_min) + Y_min
-    
     if isinstance(mass, float):
         pred_logf = pred_logf[0]
-    
+
     pred_flux = (10 ** pred_logf) * uu.erg / uu.s / uu.Hz
-    
     output = namedtuple('output', ['spectrum', 'frequency', 'time'])
     return output(
         spectrum=pred_flux,
