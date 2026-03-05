@@ -1,3 +1,9 @@
+> **Repository moved**
+>
+> Canonical repository: https://github.com/Her00000/redback_surrogates-lfs
+>
+> This fork is kept only for historical reference.
+
 # `Redback_surrogates`
 This is an optional package built to be used via [Redback](https://redback.readthedocs.io/en/latest/) or independently. 
 This package contains the data and methods to build/call surrogate models for EM transients using machine learning built on grids of numerical simulations.
