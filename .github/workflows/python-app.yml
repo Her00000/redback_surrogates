@@ -40,7 +40,7 @@ jobs:
         pip install --no-cache-dir pytest-cov coverage coverage-badge coveralls
     - name: Run tests
       run: |
-        coverage run --omit="*_remote_module_non_scriptable.py" -m pytest test/ --durations=10
+        coverage run -m pytest test/ --durations=10
         coverage lcov --ignore-errors
         coverage html --ignore-errors
     - name: Archive production artifacts
